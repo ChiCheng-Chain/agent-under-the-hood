@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>第二阶段流程图（可治理的 Agent Runtime）</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+  body {
+    font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 32px 24px 64px;
+    background: #fafafa;
+    color: #222;
+  }
+  h1 { font-size: 22px; }
+  h2 {
+    font-size: 18px;
+    margin-top: 44px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid #ddd;
+  }
+  .desc { color: #666; font-size: 14px; margin: 4px 0 12px; }
+  .mermaid {
+    background: #fff;
+    border: 1px solid #e0e0e0;
+    border-radius: 8px;
+    padding: 20px;
+    text-align: center;
+  }
+  .note {
+    background: #fff8e1;
+    border-left: 3px solid #ffb300;
+    padding: 10px 14px;
+    font-size: 13px;
+    margin: 12px 0;
+    border-radius: 4px;
+  }
+  .legend {
+    font-size: 13px;
+    color: #555;
+    background: #fff;
+    border: 1px dashed #ccc;
+    padding: 10px 14px;
+    border-radius: 6px;
+    margin: 10px 0 20px;
+  }
+</style>
+</head>
+<body>
+<h1>第二阶段流程图：可治理的 Agent Runtime</h1>
+<p class="desc">每个节点：第一行为代码标识，第二行为中文含义解释。基于第二阶段实际代码绘制。</p>
+
+<div class="note">若下图未显示，说明当前无法加载 CDN，请联网后刷新本页。</div>
+<div class="legend">阅读约定：菱形 {} 表示判断分支；矩形 [] 表示动作/状态；箭头标签表示分支条件。</div>
+
+<h2>① 第二阶段 AgentRunner 增强闭环</h2>
+<p class="desc">在第一阶段闭环上叠加：模型调用走 ResilientModelGateway（含 retry/fallback），工具调用走 ToolRuntime（含 policy/audit），全部挂到 trace tree。</p>
+<div class="mermaid">
+flowchart TD
+    A["用户输入<br/>CLI 接收输入"] --> B["start_span AGENT<br/>开启根 span（agent）"]
+    B --> C["messages = system + user<br/>初始化对话历史"]
+    C --> D{"step ≤ max_steps?<br/>是否未超最大循环次数"}
+    D -->|否| E["end_span error<br/>MaxStepsExceeded 超限结束"]
+    E --> F["返回 AgentResult error<br/>带错误的结果"]
+    D -->|是| G["start_span MODEL<br/>开启模型 span"]
+    G --> H["ResilientModelGateway.invoke<br/>调用弹性网关（内部含 retry/fallback）"]
+    H --> I{"调用成功?<br/>是否抛 ModelError"}
+    I -->|失败| J["end_span MODEL error<br/>记录模型错误 span"]
+    J --> K["end_span AGENT error<br/>结束根 span"]
+    K --> F
+    I -->|成功| L["end_span MODEL ok<br/>记录模型 span"]
+    L --> M{"finish_reason?<br/>模型返回类型"}
+    M -->|FINAL_ANSWER| N["record_final<br/>记录最终输出 span"]
+    N --> O["end_span AGENT ok<br/>正常结束根 span"]
+    O --> P["返回 final_answer<br/>返回最终答案"]
+    M -->|TOOL_CALL| Q["追加 assistant 消息<br/>工具调用决策入历史"]
+    Q --> R["ToolRuntime.execute<br/>执行工具（内部含 policy/audit）"]
+    R --> S["observation 回喂<br/>工具结果作为 tool 消息喂回"]
+    S --> D
+</div>
+
+<h2>② ResilientModelGateway 错误治理</h2>
+<p class="desc">主模型重试（指数退避）→ 不可重试错误立即抛 → 重试耗尽后 fallback 到备用模型。每次 retry/fallback 写 trace span。</p>
+<div class="mermaid">
+flowchart TD
+    A["invoke primary<br/>调用主模型"] --> B{"成功?<br/>是否抛 ModelError"}
+    B -->|成功| C["返回 ModelResponse<br/>正常返回响应"]
+    B -->|失败| D{"error_type 可重试?<br/>TIMEOUT/RATE_LIMIT/PROVIDER_UNAVAILABLE"}
+    D -->|否 AUTH_ERROR/BAD_REQUEST| E["立即抛出 ModelError<br/>不重试，不记 retry span"]
+    D -->|是| F["record_retry span<br/>记录重试 span（model 的子 span）"]
+    F --> G["exponential backoff<br/>指数退避等待"]
+    G --> H{"attempt ≤ max_retries?<br/>还有重试次数"}
+    H -->|是| A
+    H -->|否 耗尽| I{"有 fallback?<br/>是否配置备用模型"}
+    I -->|无| J["抛出最后 ModelError<br/>无备用模型，失败抛出"]
+    I -->|有| K["record_fallback span<br/>记录 fallback span"]
+    K --> L["invoke fallback<br/>调用备用模型（仅一次）"]
+    L --> M{"成功?<br/>备用模型是否成功"}
+    M -->|成功| C
+    M -->|失败| J
+</div>
+
+<h2>③ ToolRuntime 权限与风险控制</h2>
+<p class="desc">执行前依次做 schema 校验 → permission check → risk policy check；所有路径（成功/失败/拒绝/确认/阻断）都写 audit log 和 tool span。</p>
+<div class="mermaid">
+flowchart TD
+    A["execute name args ctx<br/>开始执行工具"] --> B["start_span TOOL<br/>开启工具 span（agent 的子 span）"]
+    B --> C["registry.get<br/>查找工具"]
+    C --> D{"工具存在?<br/>是否已注册"}
+    D -->|否| E["ToolResult ERROR<br/>NOT_FOUND 工具不存在"]
+    D -->|是| F["schema validation<br/>按 input_schema 校验参数"]
+    F --> G{"校验通过?<br/>参数是否合法"}
+    G -->|否| H["ToolResult ERROR<br/>VALIDATION_ERROR 参数错误"]
+    G -->|是| I["ToolPolicy.check<br/>权限与风险判断"]
+    I --> J["record_policy span<br/>记录策略 span（tool 的子 span）"]
+    J --> K{"decision?<br/>策略决策结果"}
+    K -->|read_only / write 有 scope| L["ALLOWED<br/>允许执行"]
+    K -->|write 无 scope| M["ToolResult DENIED<br/>PERMISSION_DENIED 权限不足"]
+    K -->|external_side_effect 需确认| N["ToolResult REQUIRES_CONFIRMATION<br/>需人工确认"]
+    K -->|destructive| O["ToolResult BLOCKED<br/>高风险阻断，不执行"]
+    L --> P["handler 执行<br/>调用工具处理函数"]
+    P --> Q{"执行异常?<br/>是否抛错"}
+    Q -->|是| R["ToolResult ERROR<br/>EXECUTION_ERROR 执行异常"]
+    Q -->|否| S["ToolResult SUCCESS<br/>成功返回结果"]
+    E --> T["写 audit log + end_span<br/>记录审计并结束工具 span"]
+    H --> T
+    M --> T
+    N --> T
+    O --> T
+    R --> T
+    S --> T
+    T --> U["返回 ToolResult<br/>返回结构化结果"]
+</div>
+
+<h2>④ ToolPolicy 风险决策树</h2>
+<p class="desc">按 risk_level 决定：read_only 放行；write 查 scope；external_side_effect 查 scope 且需确认；destructive 默认阻断。</p>
+<div class="mermaid">
+flowchart TD
+    A["ToolPolicy.check<br/>策略判断入口"] --> B{"risk_level?<br/>风险等级"}
+    B -->|read_only| C["ALLOWED<br/>有 schema 即自动放行"]
+    B -->|write| D{"具备 required_scopes?<br/>是否有写权限"}
+    D -->|否| E["DENIED<br/>权限不足，列出缺失 scope"]
+    D -->|是| F["ALLOWED<br/>权限校验通过"]
+    B -->|external_side_effect| G{"具备 required_scopes?<br/>是否有副作用权限"}
+    G -->|否| E
+    G -->|是| H{"require_confirmation?<br/>上下文是否允许确认流程"}
+    H -->|是| I["REQUIRES_CONFIRMATION<br/>需人工确认后执行"]
+    H -->|否| J["DENIED<br/>需确认但不允许确认流程，降级拒绝"]
+    B -->|destructive| K["BLOCKED<br/>即使有 scope 也默认阻断"]
+</div>
+
+<h2>⑤ trace tree 结构（一次含 retry 与工具调用的任务）</h2>
+<p class="desc">AgentRunner 是 root，model/tool 是 agent 子 span，retry/fallback 是 model 子 span，policy/audit 是 tool 子 span。</p>
+<div class="mermaid">
+flowchart TD
+    AGENT["agent span（root）<br/>任务根 span，parent=None"] --> M1["model step1<br/>第一次模型调用"]
+    AGENT --> TOOL["tool:search_docs<br/>工具调用"]
+    AGENT --> M2["model step2<br/>基于 observation 的模型调用"]
+    AGENT --> FINAL["final span<br/>最终输出"]
+    M1 --> RETRY["retry span<br/>模型重试（model 的子 span）"]
+    M1 -.可能.-> FALLBACK["fallback span<br/>切换备用模型（model 的子 span）"]
+    TOOL --> POLICY["policy:search_docs<br/>策略检查（tool 的子 span）"]
+    TOOL --> AUDIT["audit:search_docs<br/>审计写入（tool 的子 span）"]
+</div>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: "default", flowchart: { htmlLabels: true } });
+</script>
+</body>
+</html>
