@@ -1,0 +1,26 @@
+# 环境变量与密钥
+.env
+
+# 运行时产物
+traces.jsonl
+audit.jsonl
+eval_runs/
+eval_runs_test/
+eval_dbg/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+*.log
+
+# 工具目录（非本项目代码）
+.claude/
+.codex/
+openspec/

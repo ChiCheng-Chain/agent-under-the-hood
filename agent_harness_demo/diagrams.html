@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>agent_harness_demo 流程图（含中文解释）</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+  body {
+    font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 32px 24px 64px;
+    background: #fafafa;
+    color: #222;
+  }
+  h1 { font-size: 22px; }
+  h2 {
+    font-size: 18px;
+    margin-top: 40px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid #ddd;
+  }
+  .desc { color: #666; font-size: 14px; margin: 4px 0 12px; }
+  .mermaid {
+    background: #fff;
+    border: 1px solid #e0e0e0;
+    border-radius: 8px;
+    padding: 20px;
+    text-align: center;
+  }
+  .note {
+    background: #fff8e1;
+    border-left: 3px solid #ffb300;
+    padding: 10px 14px;
+    font-size: 13px;
+    margin: 12px 0;
+    border-radius: 4px;
+  }
+  .legend {
+    font-size: 13px;
+    color: #555;
+    background: #fff;
+    border: 1px dashed #ccc;
+    padding: 10px 14px;
+    border-radius: 6px;
+    margin: 10px 0 20px;
+  }
+</style>
+</head>
+<body>
+<h1>agent_harness_demo 流程图</h1>
+<p class="desc">每个节点：第一行为代码标识，第二行为中文含义解释。</p>
+
+<div class="note">若下图未显示，说明当前无法加载 CDN，请联网后刷新本页。</div>
+
+<div class="legend">阅读约定：菱形 {} 表示判断分支；矩形 [] 表示动作/状态；箭头标签表示分支条件。</div>
+
+<h2>① AgentRunner 主闭环</h2>
+<p class="desc">用户输入 → 模型 → 工具 → observation 回喂 → 最终输出，全程记 trace。</p>
+<div class="mermaid">
+flowchart TD
+    A["CLI 输入<br/>命令行接收用户输入"] --> B["load_settings<br/>读取 .env 与环境变量"]
+    B --> C{"USE_REAL_MODEL?<br/>是否启用真实模型"}
+    C -->|false| D["MockModelClient<br/>模拟客户端，无需模型"]
+    C -->|true| E["OpenAICompatibleClient<br/>真实 OpenAI 兼容客户端"]
+    D --> F["AgentRunner.run<br/>启动 Agent 主循环"]
+    E --> F
+    F --> G["start_span(RUN)<br/>开始记录根 trace span"]
+    G --> H["messages = system + user<br/>初始化对话历史"]
+    H --> I{"step ≤ max_steps?<br/>是否未超最大循环次数"}
+    I -->|否| J["end_span error<br/>MaxStepsExceeded 超限结束"]
+    J --> K["返回 AgentResult<br/>带 error 的结果"]
+    I -->|是| L["ModelRequest<br/>组装请求（含工具列表）"]
+    L --> M["model.invoke<br/>调用模型客户端"]
+    M --> N{"调用成功?<br/>是否抛 ModelError"}
+    N -->|ModelError| O["end_span error<br/>记录模型错误并结束"]
+    O --> K
+    N -->|成功| P["record_model_call<br/>记录模型调用 span"]
+    P --> Q{"finish_reason?<br/>模型返回类型"}
+    Q -->|FINAL_ANSWER| R["record_final<br/>记录最终输出 span"]
+    R --> S["end_span ok<br/>正常结束根 span"]
+    S --> T["返回 final_answer<br/>返回最终答案"]
+    Q -->|TOOL_CALL| U["追加 assistant 消息<br/>工具调用决策入历史"]
+    U --> V["遍历 tool_call<br/>逐个处理工具调用"]
+    V --> W["ToolRuntime.execute<br/>执行工具"]
+    W --> X["record_tool_call<br/>记录工具调用 span"]
+    X --> Y["observation 回喂<br/>工具结果作为新消息喂回模型"]
+    Y --> I
+    Q -->|未知| Z["UnknownFinishReason<br/>未知返回类型，报错结束"]
+    Z --> K
+</div>
+
+<h2>② ToolRuntime 执行收口</h2>
+<p class="desc">工具不存在 / 参数错误 / 执行异常都收口成结构化 ToolResult，不抛异常给上层。</p>
+<div class="mermaid">
+flowchart TD
+    A["ToolRuntime.execute<br/>开始执行工具"] --> B["registry.get<br/>从注册表查找工具"]
+    B --> C{"工具存在?<br/>是否已注册"}
+    C -->|否| D["ToolResult ok=False<br/>NOT_FOUND 工具不存在"]
+    C -->|是| E["_validate<br/>按 input_schema 校验参数"]
+    E --> F{"校验通过?<br/>参数是否合法"}
+    F -->|否| G["ToolResult ok=False<br/>VALIDATION_ERROR 参数错误"]
+    F -->|是| H["handler(**validated)<br/>执行工具处理函数"]
+    H --> I{"执行异常?<br/>是否抛错"}
+    I -->|是| J["ToolResult ok=False<br/>EXECUTION_ERROR 执行异常"]
+    I -->|否| K["ToolResult ok=True<br/>成功返回结果"]
+</div>
+
+<h2>③ trace span 树（一次真实任务）</h2>
+<p class="desc">取自运行时的 traces.jsonl，parent_span_id 决定层级。</p>
+<div class="mermaid">
+flowchart TD
+    R["run span<br/>任务根 span (33ms, ok)"] --> M1["model #1<br/>第一次模型调用 → search_docs"]
+    R --> T1["tool: search_docs<br/>工具调用 → 退款政策..."]
+    R --> M2["model #2<br/>基于 observation → final"]
+    R --> F["final span<br/>最终输出 span"]
+</div>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: "default", flowchart: { htmlLabels: true } });
+</script>
+</body>
+</html>
